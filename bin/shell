@@ -89,16 +89,14 @@ class Shell(object):
         return self.command
 
     def parse_cmd(self, origin_cmd):
-        svn_vars = dict(
-            email=self.email,
-            username=self.email.partition('@')[0],
-            repopath=self.expand_path,
-        )
-
         if origin_cmd:
             for pattern, svn_cmd in self.kSvnCommands:
                 if pattern.match(origin_cmd):
-                    return svn_cmd % svn_vars
+                    return svn_cmd % dict(
+                        email=self.email,
+                        username=self.email.partition('@')[0],
+                        repopath=self.expand_path,
+                    )
 
             if self.strict:
                 print('Disallowed command,', repr(origin_cmd), file=sys.stderr)
