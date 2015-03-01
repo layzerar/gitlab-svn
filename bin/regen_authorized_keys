@@ -6,7 +6,6 @@ from __future__ import print_function
 import sys
 
 import argparse
-import jinja2
 
 
 parser = argparse.ArgumentParser(
@@ -20,7 +19,7 @@ parser.add_argument(
     '-o', '--output', dest='output', default=None, help='output file'
 )
 parser.add_argument(
-    '--command', dest='command', required=True, help='command for reformat(jinja2 template language)'
+    '--command', dest='command', required=True, help='command for reformat(python eval expr)'
 )
 
 
@@ -86,7 +85,7 @@ class KeysReGenerator(object):
             if len(fields) == 3:
                 comment = fields[2]
             else:
-                comment = ''
+                comment = None
             if key_type.startswith('ssh-'):
                 return options, key_type, pubkey, comment
 
@@ -99,23 +98,33 @@ class KeysReGenerator(object):
         else:
             options, key_type, pubkey, comment = self.parse_line_fields(line)
 
-            regen_options = []
-            for option in options:
-                if option.startswith(self.kCommandPrefix):
-                    regen_command = jinja2.Template(self.command).render(
-                        keytype=key_type,
-                        pubkey=pubkey,
-                        comment=comment,
-                    )
-                    regen_option = '%s"%s"' % (self.kCommandPrefix, regen_command)
-                    regen_options.append(regen_option)
-                else:
-                    regen_options.append(option)
+            regen_command = eval(
+                self.command,
+                locals=dict(
+                    keytype=key_type,
+                    pubkey=pubkey,
+                    comment=comment,
+                ),
+            )
+            if not isinstance(regen_command, basestring) or not regen_command:
+                return
 
-            if regen_options:
-                regen_line = ' '.join([','.join(regen_options), key_type, pubkey, comment])
+            regen_option = '%s"%s"' % (self.kCommandPrefix, regen_command)
+            regen_index = -1
+            for index, option in enumerate(options):
+                if option.startswith(self.kCommandPrefix):
+                    regen_index = index
+                    break
+
+            regen_options = list(options)
+            if regen_index >= 0:
+                regen_options[regen_index] = regen_option
             else:
-                regen_line = ' '.join([key_type, pubkey, comment])
+                regen_options.insert(0, regen_option)
+            regen_fields = [','.join(regen_options), key_type, pubkey]
+            if comment:
+                regen_fields.append(comment)
+            regen_line = ' '.join(regen_fields)
         print(regen_line, file=self.ofp)
 
     def process(self):
