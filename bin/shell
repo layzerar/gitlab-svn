@@ -1,0 +1,138 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from __future__ import print_function
+
+import os
+import os.path
+import re
+import sys
+import subprocess
+import json
+
+import argparse
+
+
+parser = argparse.ArgumentParser(
+    prog='shell',
+    description='custom shell for subversion server'
+)
+parser.add_argument(
+    '-i', dest='email', required=True, help='identify email'
+)
+parser.add_argument(
+    '-r', '--root', dest='path', default='~/repositories', help='repositories path'
+)
+parser.add_argument(
+    '--command', dest='command', default=None, help='command for test'
+)
+parser.add_argument(
+    '--redefine', dest='redefine', default=None, help='file for redefine commands'
+)
+
+
+class Shell(object):
+    kEmailRegex = re.compile(
+        "^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@"
+        "(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$",
+        re.IGNORECASE,
+    )
+    kSvnCommands = [
+        (re.compile('^svnserve -t'), 'svnserve -t --tunnel-user=%(username)s --root="%(repopath)s"')
+    ]
+
+    def __init__(self, email, path, command=None, strict=True):
+        self.email = email
+        self.path = path
+        self.expand_path = os.path.expanduser(self.path)
+        self.command = command
+        self.strict = strict
+
+    def redefine_commands(self, commands):
+        svn_commands = []
+        for pattern, command in commands:
+            svn_commands.append(
+                (re.compile(pattern), command)
+            )
+        self.kSvnCommands[:] = svn_commands
+
+    def redefine_commands_by_file(self, filepath):
+        commands = json.load(open(filepath))
+        if isinstance(commands, dict):
+            commands = commands.items()
+        self.redefine_commands(commands)
+
+    def check_email(self):
+        ok = bool(self.kEmailRegex.match(self.email))
+        if not ok and self.strict:
+            print('Invalid email address:', repr(self.email), file=sys.stderr)
+            self.quit(1)
+        return ok
+
+    def check_repo_path(self):
+        ok = os.path.isdir(self.expand_path)
+        if not ok and self.strict:
+            print('Repositories directory not exists:', repr(self.path), file=sys.stderr)
+            self.quit(1)
+        return ok
+
+    def check_ssh_env(self):
+        ok = 'SSH_CONNECTION' in os.environ
+        if not ok and self.command is None and self.strict:
+            print('Only ssh allowed', file=sys.stderr)
+            self.quit(1)
+        return ok
+
+    def get_ssh_origin_cmd(self):
+        if self.command is None:
+            return os.environ.get('SSH_ORIGINAL_COMMAND', '')
+        return self.command
+
+    def parse_cmd(self, origin_cmd):
+        svn_vars = dict(
+            email=self.email,
+            username=self.email.partition('@')[0],
+            repopath=self.expand_path,
+        )
+
+        if origin_cmd:
+            for pattern, svn_cmd in self.kSvnCommands:
+                if pattern.match(origin_cmd):
+                    return svn_cmd % svn_vars
+
+            if self.strict:
+                print('Disallowed command,', repr(origin_cmd), file=sys.stderr)
+                self.quit(1)
+        else:
+            if self.strict:
+                print('Welcome to subversion, %(username)s!' % svn_vars)
+                self.quit(0)
+
+        return None
+
+    def execute(self):
+        self.check_ssh_env()
+        self.check_email()
+        self.check_repo_path()
+
+        svn_cmd = self.parse_cmd(self.get_ssh_origin_cmd())
+        if svn_cmd:
+            status = subprocess.call(svn_cmd, shell=True)
+        else:
+            status = 0
+        self.quit(status)
+
+    def quit(self, status):
+        exit(status)
+
+
+def main():
+    args = parser.parse_args()
+    sh = Shell(args.email, args.path, command=args.command)
+    if args.redefine:
+        sh.redefine_commands_by_file(args.redefine)
+    sh.execute()
+
+
+if __name__ == '__main__':
+    main()
