@@ -1,0 +1,141 @@
+#! /usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from __future__ import print_function
+
+import sys
+
+import argparse
+import jinja2
+
+
+parser = argparse.ArgumentParser(
+    prog='regen_authorized_keys',
+    description='regenerate authorized_keys'
+)
+parser.add_argument(
+    '-i', '--input', dest='input', default=None, help='input file'
+)
+parser.add_argument(
+    '-o', '--output', dest='output', default=None, help='output file'
+)
+parser.add_argument(
+    '--command', dest='command', required=True, help='command for reformat'
+)
+
+
+class KeysReGenerator(object):
+    kCommandPrefix = 'command='
+
+    def __init__(self, command, ifp=sys.stdin, ofp=sys.stdout):
+        self.ifp = ifp
+        self.ofp = ofp
+        self.command = command
+
+    def close(self):
+        if self.ifp is not sys.stdin:
+            self.ifp.close()
+        if self.ofp is not sys.stdout:
+            self.ofp.close()
+
+    def parse_line_options(self, line):
+        skip = 0
+        quoted = None
+
+        index = 0
+        option = ''
+        options = []
+        for index, ch in enumerate(line, 1):
+            if skip > 0:
+                skip -= 1
+            else:
+                if ch == " ":
+                    if quoted is None:
+                        break
+                elif ch == ",":
+                    if quoted is None:
+                        if option:
+                            options.append(option)
+                        option = ''
+                        continue
+                elif ch == "\\":
+                    skip += 1
+                elif ch in ['"', "'"]:
+                    if quoted is None:
+                        quoted = ch
+                    elif quoted == ch:
+                        quoted = None
+            option += ch
+
+        if option:
+            options.append(option)
+        if quoted:
+            raise ValueError("cannot parse option: %s" % repr(line))
+        return options, line[index:]
+
+    def parse_line_fields(self, line):
+        if line.startswith('ssh-'):
+            options, rest = [], line
+        else:
+            options, rest = self.parse_line_options(line)
+
+        fields = rest.split(' ', 2)
+        if len(fields) in (2, 3):
+            key_type = fields[0]
+            pubkey = fields[1]
+            if len(fields) == 3:
+                comment = fields[2]
+            else:
+                comment = ''
+            if key_type.startswith('ssh-'):
+                return options, key_type, pubkey, comment
+
+        raise ValueError("cannot parse line: %s" % repr(rest))
+
+    def process_line(self, line):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            regen_line = line
+        else:
+            options, key_type, pubkey, comment = self.parse_line_fields(line)
+
+            regen_options = []
+            for option in options:
+                if option.startswith(self.kCommandPrefix):
+                    regen_command = jinja2.Template(self.command).render(
+                        keytype=key_type,
+                        pubkey=pubkey,
+                        comment=comment,
+                    )
+                    regen_option = '%s"%s"' % (self.kCommandPrefix, regen_command)
+                    regen_options.append(regen_option)
+                else:
+                    regen_options.append(option)
+
+            if regen_options:
+                regen_line = ' '.join([','.join(regen_options), key_type, pubkey, comment])
+            else:
+                regen_line = ' '.join([key_type, pubkey, comment])
+        print(regen_line, file=self.ofp)
+
+    def process(self):
+        for line in self.ifp:
+            self.process_line(line)
+
+
+def main():
+    args = parser.parse_args()
+    kwargs = {}
+    if args.input:
+        kwargs['ifp'] = open(args.input, 'r')
+    if args.output:
+        kwargs['ofp'] = open(args.output, 'w')
+    generator = KeysReGenerator(args.command, **kwargs)
+    try:
+        generator.process()
+    finally:
+        generator.close()
+
+
+if __name__ == '__main__':
+    main()
