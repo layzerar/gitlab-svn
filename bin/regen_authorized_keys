@@ -20,7 +20,7 @@ parser.add_argument(
     '-o', '--output', dest='output', default=None, help='output file'
 )
 parser.add_argument(
-    '--command', dest='command', required=True, help='command for reformat'
+    '--command', dest='command', required=True, help='command for reformat(jinja2 template language)'
 )
 
 
