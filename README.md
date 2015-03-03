@@ -22,7 +22,7 @@ cd /home/svn/
 sudo -u svn -H git clone https://github.com/layzerar/svn-ssh.git
 sudo -u svn -H mkdir -m 700 .ssh
 sudo -u svn -H mkdir -m 750 repositories
-sudo regen_authorized_keys --input=/home/git/.ssh/authorized_keys --command="/home/svn/svn-ssh/bin/shell -i {{shquote(comment)}} --root=/home/svn/repositories" > /home/svn/.ssh/authorized_keys
+sudo /home/svn/svn-ssh/bin/regen_authorized_keys --input=/home/git/.ssh/authorized_keys --command="/home/svn/svn-ssh/bin/shell -i {{shquote(comment)}} --root=/home/svn/repositories" > /home/svn/.ssh/authorized_keys
 sudo chown svn:svn /home/svn/.ssh/authorized_keys
 sudo chmod 600 /home/svn/.ssh/authorized_keys
 ```
