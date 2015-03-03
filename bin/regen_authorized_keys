@@ -1,11 +1,13 @@
-#! /usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 from __future__ import print_function
 
+import re
 import sys
 
 import argparse
+import jinja2
 
 
 parser = argparse.ArgumentParser(
@@ -19,17 +21,44 @@ parser.add_argument(
     '-o', '--output', dest='output', default=None, help='output file'
 )
 parser.add_argument(
-    '--command', dest='command', required=True, help='command for reformat(python eval expr)'
+    '--command', dest='command', required=True,
+    help='command for reformat(jinja2 template language)'
 )
+
+_find_unsafe = re.compile(r'[^\w@%+=:,./-]').search
+
+
+def quote(s):
+    """Return a shell-escaped version of the string *s*."""
+    if not s:
+        return "''"
+    if _find_unsafe(s) is None:
+        return s
+
+    # use single quotes, and put single quotes into double quotes
+    # the string $'b is then quoted as '$'"'"'b'
+    return "'" + s.replace("'", "'\"'\"'") + "'"
 
 
 class KeysReGenerator(object):
     kCommandPrefix = 'command='
+    kTemplateGlobals = dict(
+        shquote=quote,
+    )
 
     def __init__(self, command, ifp=sys.stdin, ofp=sys.stdout):
         self.ifp = ifp
         self.ofp = ofp
         self.command = command
+        self.templates = {}
+
+    def render_template(self, command, context):
+        template = self.templates.get(command, None)
+        if template is None:
+            env = jinja2.Environment()
+            template = env.from_string(command, globals=self.kTemplateGlobals)
+            self.templates[command] = template
+        return template.render(context)
 
     def close(self):
         if self.ifp is not sys.stdin:
@@ -98,13 +127,13 @@ class KeysReGenerator(object):
         else:
             options, key_type, pubkey, comment = self.parse_line_fields(line)
 
-            regen_command = eval(
+            regen_command = self.render_template(
                 self.command,
-                locals=dict(
+                dict(
                     keytype=key_type,
                     pubkey=pubkey,
                     comment=comment,
-                ),
+                )
             )
             if not isinstance(regen_command, basestring) or not regen_command:
                 return

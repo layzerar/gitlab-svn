@@ -11,6 +11,7 @@ import subprocess
 import json
 
 import argparse
+import jinja2
 
 
 parser = argparse.ArgumentParser(
@@ -21,14 +22,84 @@ parser.add_argument(
     '-i', dest='email', required=True, help='identify email'
 )
 parser.add_argument(
-    '-r', '--root', dest='path', default='~/repositories', help='repositories path'
+    '-r', '--root', dest='path', default='~/repositories',
+    help='repositories path'
 )
 parser.add_argument(
     '--command', dest='command', default=None, help='command for test'
 )
 parser.add_argument(
-    '--redefine', dest='redefine', default=None, help='file for redefine commands'
+    '--redefine', dest='redefine', default=None,
+    help='file for redefine commands'
 )
+
+_find_unsafe = re.compile(r'[^\w@%+=:,./-]').search
+
+
+def quote(s):
+    """Return a shell-escaped version of the string *s*."""
+    if not s:
+        return "''"
+    if _find_unsafe(s) is None:
+        return s
+
+    # use single quotes, and put single quotes into double quotes
+    # the string $'b is then quoted as '$'"'"'b'
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+_template_cache = {}
+_template_globals = dict(
+    shquote=quote,
+)
+
+
+def create_template(tpl_cmd):
+    template = _template_cache.get(tpl_cmd, None)
+    if template is None:
+        env = jinja2.Environment()
+        template = env.from_string(tpl_cmd, globals=_template_globals)
+        _template_cache[tpl_cmd] = template
+    return template
+
+
+def render_template(tpl_cmd, context):
+    template = create_template(tpl_cmd)
+    return template.render(context)
+
+
+class CallMethod(object):
+    NAME = 'call'
+
+    def __init__(self, shell):
+        self.shell = shell
+
+    def __call__(self, tpl_cmd):
+        svn_cmd = render_template(tpl_cmd, self.shell.get_context())
+        return subprocess.call(svn_cmd, shell=True)
+
+
+class EchoMethod(object):
+    NAME = 'echo'
+
+    def __init__(self, shell):
+        self.shell = shell
+
+    def __call__(self, tpl_msg=None):
+        if tpl_msg:
+            message = render_template(tpl_msg, self.shell.get_context())
+            print(message, file=sys.stderr)
+        return 0
+
+
+class ExitMethod(object):
+    NAME = 'exit'
+
+    def __init__(self, shell):
+        self.shell = shell
+
+    def __call__(self, status=0):
+        return self.shell.quit(status)
 
 
 class Shell(object):
@@ -38,49 +109,84 @@ class Shell(object):
         re.IGNORECASE,
     )
     kSvnCommands = [
-        (re.compile('^svnserve -t'), 'svnserve -t --tunnel-user=%(username)s --root="%(repopath)s"')
+        (
+            re.compile('^svnserve( -t)?$'),
+            'call',
+            'svnserve -t -r {{shquote(repopath)}} --tunnel-user={{shquote(username)}}',
+        ),
+        (
+            re.compile('^whoami$'),
+            'echo',
+            '{{username}}',
+        ),
+        (
+            re.compile('^(exit|logout)$'),
+            'exit',
+        ),
     ]
 
-    def __init__(self, email, path, command=None, strict=True):
+    def __init__(self, email, path, command=None, methods=(), strict=True):
         self.email = email
         self.path = path
         self.expand_path = os.path.expanduser(self.path)
         self.command = command
         self.strict = strict
+        self.methods = {}
+        self._default_cmd = None
+
+        self._init_methods(methods)
+        self.set_default_cmd('echo', 'Welcome, {{email}}!')
+
+    def _init_methods(self, methods):
+        for method_class in [CallMethod, EchoMethod, ExitMethod] + list(methods):
+            method = method_class(self)
+            self.methods[method.NAME] = method
+
+    def set_default_cmd(self, method_name, *args):
+        self._default_cmd = self.methods[method_name], args
+
+    def get_context(self):
+        return dict(
+            email=self.email,
+            username=self.email.partition('@')[0],
+            repopath=self.expand_path,
+        )
 
     def redefine_commands(self, commands):
         svn_commands = []
-        for pattern, command in commands:
+        for cmd_spec in commands:
+            pattern, method_name = cmd_spec[:2]
+            if method_name not in self.methods:
+                raise ValueError("Unsupport Method, %s!" % repr(method_name))
             svn_commands.append(
-                (re.compile(pattern), command)
+                tuple([re.compile(pattern), method_name] + cmd_spec[2:])
             )
         self.kSvnCommands[:] = svn_commands
 
     def redefine_commands_by_file(self, filepath):
         commands = json.load(open(filepath))
-        if isinstance(commands, dict):
-            commands = commands.items()
         self.redefine_commands(commands)
 
     def check_email(self):
         ok = bool(self.kEmailRegex.match(self.email))
         if not ok and self.strict:
             print('Invalid email address:', repr(self.email), file=sys.stderr)
-            self.quit(1)
+            return self.quit(1)
         return ok
 
     def check_repo_path(self):
         ok = os.path.isdir(self.expand_path)
         if not ok and self.strict:
-            print('Repositories directory not exists:', repr(self.path), file=sys.stderr)
-            self.quit(1)
+            print('Repositories directory not exists:', repr(self.path),
+                  file=sys.stderr)
+            return self.quit(1)
         return ok
 
     def check_ssh_env(self):
         ok = 'SSH_CONNECTION' in os.environ
         if not ok and self.command is None and self.strict:
             print('Only ssh allowed', file=sys.stderr)
-            self.quit(1)
+            return self.quit(1)
         return ok
 
     def get_ssh_origin_cmd(self):
@@ -90,35 +196,26 @@ class Shell(object):
 
     def parse_cmd(self, origin_cmd):
         if origin_cmd:
-            for pattern, svn_cmd in self.kSvnCommands:
-                if pattern.match(origin_cmd):
-                    return svn_cmd % dict(
-                        email=self.email,
-                        username=self.email.partition('@')[0],
-                        repopath=self.expand_path,
-                    )
+            for cmd_spec in self.kSvnCommands:
+                pattern, method_name = cmd_spec[:2]
+                if not pattern.match(origin_cmd):
+                    continue
+                return self.methods[method_name], cmd_spec[2:]
 
             if self.strict:
                 print('Disallowed command,', repr(origin_cmd), file=sys.stderr)
-                self.quit(1)
+                return self.quit(1)
 
-        return None
-
-    def welcome(self):
-        print('Welcome to subversion,', self.email)
-        return 0
+        return self._default_cmd
 
     def execute(self):
         self.check_ssh_env()
         self.check_email()
         self.check_repo_path()
 
-        svn_cmd = self.parse_cmd(self.get_ssh_origin_cmd())
-        if svn_cmd:
-            status = subprocess.call(svn_cmd, shell=True)
-        else:
-            status = self.welcome()
-        self.quit(status)
+        method, args = self.parse_cmd(self.get_ssh_origin_cmd())
+        status = method(*args)
+        return self.quit(status)
 
     def quit(self, status):
         exit(status)
