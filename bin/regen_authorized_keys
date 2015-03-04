@@ -1,10 +1,11 @@
-#!/usr/bin/env python
+#! /usr/bin/env python
 # -*- coding: utf-8 -*-
 
 from __future__ import print_function
 
 import re
 import sys
+import shlex
 
 import argparse
 import jinja2
@@ -120,31 +121,33 @@ class KeysReGenerator(object):
 
         raise ValueError("cannot parse line: %s" % repr(rest))
 
-    def process_line(self, line):
-        line = line.strip()
-        if not line or line.startswith('#'):
-            regen_line = line
+    def parse_command(self, command_option):
+        raw_command = command_option[len(self.kCommandPrefix) + 1:-1]
+        return tuple(shlex.split(raw_command))
+
+    def parse_and_regen_command(self, line):
+        options, key_type, pubkey, comment = self.parse_line_fields(line)
+
+        regen_index = -1
+        for index, option in enumerate(options):
+            if option.startswith(self.kCommandPrefix):
+                regen_index = index
+                break
+
+        if regen_index >= 0:
+            cmdargs = self.parse_command(options[regen_index])
         else:
-            options, key_type, pubkey, comment = self.parse_line_fields(line)
+            cmdargs = ()
+        context = dict(
+            cmdargs=cmdargs,
+            keytype=key_type,
+            pubkey=pubkey,
+            comment=comment,
+        )
+        regen_command = self.render_template(self.command, context)
 
-            regen_command = self.render_template(
-                self.command,
-                dict(
-                    keytype=key_type,
-                    pubkey=pubkey,
-                    comment=comment,
-                )
-            )
-            if not isinstance(regen_command, basestring) or not regen_command:
-                return
-
+        if regen_command:
             regen_option = '%s"%s"' % (self.kCommandPrefix, regen_command)
-            regen_index = -1
-            for index, option in enumerate(options):
-                if option.startswith(self.kCommandPrefix):
-                    regen_index = index
-                    break
-
             regen_options = list(options)
             if regen_index >= 0:
                 regen_options[regen_index] = regen_option
@@ -153,7 +156,18 @@ class KeysReGenerator(object):
             regen_fields = [','.join(regen_options), key_type, pubkey]
             if comment:
                 regen_fields.append(comment)
-            regen_line = ' '.join(regen_fields)
+            return ' '.join(regen_fields)
+
+        return None
+
+    def process_line(self, line):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            regen_line = line
+        else:
+            regen_line = self.parse_and_regen_command(line)
+            if not regen_line:
+                return
         print(regen_line, file=self.ofp)
 
     def process(self):
