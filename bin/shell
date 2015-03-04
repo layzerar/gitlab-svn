@@ -9,8 +9,10 @@ import re
 import sys
 import subprocess
 import json
+import warnings
 
 import argparse
+import requests
 import jinja2
 
 
@@ -19,21 +21,49 @@ parser = argparse.ArgumentParser(
     description='custom shell for subversion server'
 )
 parser.add_argument(
-    '-i', dest='email', required=True, help='identify email'
+    '-i', dest='email', default=None, help='identify email'
 )
 parser.add_argument(
-    '-r', '--root', dest='path', default='~/repositories',
+    '-k', metavar='KEY', dest='key_id', default=None,
+    help='identify key(gitlab api)'
+)
+parser.add_argument(
+    '-du', metavar='URL', dest='discover_url',
+    default='https://127.0.0.1/api/v3/internal/discover',
+    help='key discover url(gitlab api)'
+)
+parser.add_argument(
+    '-sf', metavar='FILE', dest='secret_file',
+    default='/home/git/gitlab/.gitlab_shell_secret',
+    help='api secret token(gitlab api)'
+)
+parser.add_argument(
+    '--self-signed', dest='self_signed', default=False, action='store_true',
+    help='self signed certificate'
+)
+parser.add_argument(
+    '--use-email', dest='use_email', default=False, action='store_true',
+    help='use email as username'
+)
+parser.add_argument(
+    '--root', dest='path', default='~/repositories',
     help='repositories path'
 )
 parser.add_argument(
-    '--command', dest='command', default=None, help='command for test'
+    '--command', metavar='', dest='command', default=None,
+    help='command for test'
 )
 parser.add_argument(
-    '--redefine', dest='redefine', default=None,
+    '--redefine', metavar='', dest='redefine', default=None,
     help='file for redefine commands'
 )
 
 _find_unsafe = re.compile(r'[^\w@%+=:,./-]').search
+_verfiy_email = re.compile(
+    "^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@"
+    "(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$",
+    re.IGNORECASE,
+).match
 
 
 def quote(s):
@@ -103,16 +133,11 @@ class ExitMethod(object):
 
 
 class Shell(object):
-    kEmailRegex = re.compile(
-        "^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@"
-        "(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$",
-        re.IGNORECASE,
-    )
     kSvnCommands = [
         (
             re.compile('^svnserve( -t)?$'),
             'call',
-            'svnserve -t -r {{shquote(repopath)}} --tunnel-user={{shquote(username)}}',
+            'svnserve -t --root={{shquote(repopath)}} --tunnel-user={{shquote(username)}}',
         ),
         (
             re.compile('^whoami$'),
@@ -125,8 +150,10 @@ class Shell(object):
         ),
     ]
 
-    def __init__(self, email, path, command=None, methods=(), strict=True):
-        self.email = email
+    def __init__(self, username, uservars, path, command=None, methods=(),
+                 strict=True):
+        self.username = username
+        self.uservars = uservars
         self.path = path
         self.expand_path = os.path.expanduser(self.path)
         self.command = command
@@ -135,22 +162,23 @@ class Shell(object):
         self._default_cmd = None
 
         self._init_methods(methods)
-        self.set_default_cmd('echo', 'Welcome, {{email}}!')
+        self.set_default_cmd('echo', 'Welcome, {{username}}!')
 
     def _init_methods(self, methods):
-        for method_class in [CallMethod, EchoMethod, ExitMethod] + list(methods):
-            method = method_class(self)
+        for method_cls in [CallMethod, EchoMethod, ExitMethod] + list(methods):
+            method = method_cls(self)
             self.methods[method.NAME] = method
 
     def set_default_cmd(self, method_name, *args):
         self._default_cmd = self.methods[method_name], args
 
     def get_context(self):
-        return dict(
-            email=self.email,
-            username=self.email.partition('@')[0],
+        context = dict(
+            username=self.username,
             repopath=self.expand_path,
         )
+        context.update(self.uservars)
+        return context
 
     def redefine_commands(self, commands):
         svn_commands = []
@@ -166,13 +194,6 @@ class Shell(object):
     def redefine_commands_by_file(self, filepath):
         commands = json.load(open(filepath))
         self.redefine_commands(commands)
-
-    def check_email(self):
-        ok = bool(self.kEmailRegex.match(self.email))
-        if not ok and self.strict:
-            print('Invalid email address:', repr(self.email), file=sys.stderr)
-            return self.quit(1)
-        return ok
 
     def check_repo_path(self):
         ok = os.path.isdir(self.expand_path)
@@ -210,7 +231,6 @@ class Shell(object):
 
     def execute(self):
         self.check_ssh_env()
-        self.check_email()
         self.check_repo_path()
 
         method, args = self.parse_cmd(self.get_ssh_origin_cmd())
@@ -221,9 +241,62 @@ class Shell(object):
         exit(status)
 
 
+class GitlabAPI(object):
+    def __init__(self, key_id, discover_url, secret_file, self_signed=False):
+        self.key_id = key_id
+        self.discover_url = discover_url
+        self.secret_file = secret_file
+        self.self_signed = self_signed
+
+    def get_username(self):
+        key_id = self.key_id
+        key_name = 'key_id'
+        if key_id.startswith('key-'):
+            key_id = key_id[len('key-'):]
+        elif key_id.startswith('user-'):
+            key_id = key_id[len('user-'):]
+            key_name = 'user_id'
+
+        with open(self.secret_file) as fp:
+            secret_token = fp.readline()
+
+        with warnings.catch_warnings():
+            verify = not self.self_signed
+            if not verify:
+                warnings.simplefilter("ignore")
+            response = requests.get(
+                self.discover_url,
+                params={key_name: key_id, 'secret_token': secret_token},
+                verify=verify,
+            )
+        return json.loads(response.text).get("username", None)
+
+
 def main():
     args = parser.parse_args()
-    sh = Shell(args.email, args.path, command=args.command)
+
+    if args.email:
+        email = args.email
+        if not _verfiy_email(email):
+            print('Invalid email address:', repr(email), file=sys.stderr)
+            exit(1)
+        username = email if \
+            args.use_email else email.partition('@')[0]
+        uservars = dict(email=email)
+    elif args.key_id:
+        key_id = args.key_id
+        api = GitlabAPI(key_id, args.discover_url, args.secret_file,
+                        args.self_signed)
+        username = api.get_username()
+        if username is None:
+            print('Invalid key id:', repr(key_id), file=sys.stderr)
+            exit(1)
+        uservars = dict(key_id=key_id)
+    else:
+        print('Unauthorized access', file=sys.stderr)
+        exit(1)
+
+    sh = Shell(username, uservars, args.path, command=args.command)
     if args.redefine:
         sh.redefine_commands_by_file(args.redefine)
     sh.execute()
